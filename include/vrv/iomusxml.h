@@ -184,6 +184,8 @@ namespace musicxml {
             m_classId = SECTION;
             m_target = NULL;
             m_repeatStart = repeatStart;
+            m_movementStart = false;
+            m_movement = 0;
         }
         SectionInfo(const EndingInfo &endingInfo)
         {
@@ -192,6 +194,8 @@ namespace musicxml {
             m_target = NULL;
             m_endingInfo = endingInfo;
             m_repeatStart = false;
+            m_movementStart = false;
+            m_movement = 0;
         }
         SectionInfo(const RepeatInfo &repeatInfo)
         {
@@ -200,6 +204,8 @@ namespace musicxml {
             m_target = NULL;
             m_repeatInfo = repeatInfo;
             m_repeatStart = false;
+            m_movementStart = false;
+            m_movement = 0;
         }
 
         void merge(const EndingInfo &endingInfo)
@@ -214,6 +220,10 @@ namespace musicxml {
         EndingInfo m_endingInfo;
         RepeatInfo m_repeatInfo;
         bool m_repeatStart;
+        // first section of a movement, when the file has several (see MusicXmlInput::IsMovementStart)
+        bool m_movementStart;
+        // index of the movement, set by CreateExpansion
+        int m_movement;
         JumpInfo m_jumpInfo;
         FineInfo m_fineInfo;
         int m_visited;
@@ -473,6 +483,7 @@ private:
      */
     ///@{
     bool MeasureInExistingSection(const Measure *measure) const;
+    bool IsMovementStart(const std::string &measureNumber);
     void CreateExpansion(Section *section);
     ///@}
 
@@ -684,6 +695,8 @@ private:
     std::optional<musicxml::SectionInfo> m_sectionStop;
     std::optional<musicxml::JumpInfo> m_jumpInfo;
     std::optional<musicxml::FineInfo> m_fineInfo;
+    /* The number of the previous measure added to the sections, -1 when it has no digits */
+    int m_previousMeasureNumber = -1;
     /* The list of sections/endings to be inserted at the end of XML import */
     std::vector<std::pair<musicxml::SectionInfo, std::vector<Measure *>>> m_sections;
     /* The stack of open dashes (direction-type) containing *ControlElement, OpenDashes */

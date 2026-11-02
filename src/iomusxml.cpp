@@ -408,6 +408,11 @@ void MusicXmlInput::AddMeasure(Section *section, Measure *measure, int i)
 
     // Insert the measure in the section/ending structure that will be expanded at the end.
     if (contentMeasure && !MeasureInExistingSection(contentMeasure)) {
+        // a new movement starts a new section
+        if (IsMovementStart(contentMeasure->GetN())) {
+            if (!m_sectionStart) m_sectionStart = musicxml::SectionInfo();
+            m_sectionStart->m_movementStart = true;
+        }
         // starting a new section
         if (m_sectionStart) {
             m_sections.push_back({ *m_sectionStart, {} });
@@ -1349,17 +1354,50 @@ void MusicXmlInput::CreateExpansion(Section *section)
     // iterate on sections to create expansion
     // prepopulate the labels map because there are forward jumps (tocoda)
     bool jumpBack = false;
+    // a jump was just taken: the section it lands on is not reached in score order
+    bool jumped = false;
     auto iter = m_sections.begin();
     auto rptIter = iter;
     auto secIter = iter;
     auto endIter = iter;
-    std::map<std::string, decltype(iter)> labels;
+
+    // number the movements: with several in the file, jumps, repeats and fine stay within their movement
+    int movement = 0;
+    for (auto &section : m_sections) {
+        if (section.first.m_movementStart) ++movement;
+        section.first.m_movement = movement;
+    }
+    auto movementStart = [this](decltype(iter) it) {
+        while (it != m_sections.begin() && !it->first.m_movementStart) --it;
+        return it;
+    };
+
+    // labels by movement: exporters use the same segno / coda label in every movement
+    std::map<std::pair<int, std::string>, decltype(iter)> labels;
     for (auto it = m_sections.begin(); it != m_sections.end(); ++it) {
         if (!it->first.m_label.empty()) {
-            labels.insert({ it->first.m_label, it });
+            labels.insert({ { it->first.m_movement, it->first.m_label }, it });
         }
     }
+    auto findLabel = [&labels](int inMovement, const std::string &label) -> std::optional<decltype(iter)> {
+        auto found = labels.find({ inMovement, label });
+        if (found != labels.end()) return found->second;
+        // not in the movement of the jump: anywhere in the file
+        for (const auto &entry : labels) {
+            if (entry.first.second == label) return entry.second;
+        }
+        return std::nullopt;
+    };
+
     while (iter != m_sections.end()) {
+        // a new movement: repeats without a start go back to it, and reached in score order it is not played
+        // after a jump anymore
+        if (iter->first.m_movementStart) {
+            rptIter = iter;
+            if (!jumped) jumpBack = false;
+        }
+        jumped = false;
+
         // increment visited count
         iter->first.m_visited++;
 
@@ -1426,18 +1464,24 @@ void MusicXmlInput::CreateExpansion(Section *section)
             if (rptNestedIter) rptIter = *rptNestedIter;
         }
 
-        // fine
+        // fine: the end of the movement. Go on with the next movement, if any
         if (jumpBack && endIter->first.m_fineInfo.m_fine) {
-            break;
+            const int fineMovement = endIter->first.m_movement;
+            iter = std::find_if(endIter, m_sections.end(),
+                [fineMovement](const auto &section) { return section.first.m_movement > fineMovement; });
+            if (iter == m_sections.end()) break;
+            jumpBack = false;
+            continue;
         }
 
-        // dacapo
+        // dacapo: back to the start of the movement
         if (endIter->first.m_jumpInfo.m_jump == musicxml::JumpInfo::DACAPO
             && endIter->first.m_jumpInfo.m_times.end()
                 != std::find(endIter->first.m_jumpInfo.m_times.begin(), endIter->first.m_jumpInfo.m_times.end(),
                     endIter->first.m_visited)) {
-            iter = m_sections.begin();
+            iter = movementStart(endIter);
             jumpBack = true;
+            jumped = true;
         }
 
         // dalsegno / tocoda
@@ -1446,13 +1490,15 @@ void MusicXmlInput::CreateExpansion(Section *section)
             && endIter->first.m_jumpInfo.m_times.end()
                 != std::find(endIter->first.m_jumpInfo.m_times.begin(), endIter->first.m_jumpInfo.m_times.end(),
                     endIter->first.m_visited)) {
-            if (!labels.contains(endIter->first.m_jumpInfo.m_label)) {
+            auto target = findLabel(endIter->first.m_movement, endIter->first.m_jumpInfo.m_label);
+            if (!target) {
                 LogWarning(
                     "MusicXML import: Segno/Coda label '%s' not found", endIter->first.m_jumpInfo.m_label.c_str());
             }
             else {
-                iter = labels.at(endIter->first.m_jumpInfo.m_label);
+                iter = *target;
                 jumpBack = endIter->first.m_jumpInfo.m_jump == musicxml::JumpInfo::DALSEGNO;
+                jumped = true;
             }
         }
     }
@@ -5301,6 +5347,22 @@ bool MusicXmlInput::MeasureInExistingSection(const Measure *measure) const
         }
     }
     return false;
+}
+
+bool MusicXmlInput::IsMovementStart(const std::string &measureNumber)
+{
+    // MusicXML has no movements inside a file: exporters (e.g. MuseScore) write several movements one after the
+    // other and number the measures of each one from the start. A measure numbered 0 (pickup) or 1 after a measure
+    // with a higher number starts a new movement. Irregular measures (e.g. "X3") count by their digits.
+    std::string digits;
+    for (char c : measureNumber) {
+        if (std::isdigit(static_cast<unsigned char>(c))) digits.push_back(c);
+    }
+    const int number = (digits.empty() || digits.size() > 9) ? -1 : std::stoi(digits);
+
+    const bool isStart = ((measureNumber == "0") || (measureNumber == "1")) && (m_previousMeasureNumber > 1);
+    m_previousMeasureNumber = number;
+    return isStart;
 }
 
 void MusicXmlInput::SetFermataExternalSymbols(Fermata *fermata, const std::string &shape)
