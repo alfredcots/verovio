@@ -10,10 +10,12 @@
 //----------------------------------------------------------------------------
 
 #include <algorithm>
+#include <cmath>
 
 //----------------------------------------------------------------------------
 
 #include "arpeg.h"
+#include "artic.h"
 #include "beatrpt.h"
 #include "btrem.h"
 #include "doc.h"
@@ -812,6 +814,49 @@ FunctorCode GenerateMIDIFunctor::VisitMRpt(const MRpt *mRpt)
     return FUNCTOR_CONTINUE;
 }
 
+namespace {
+
+/**
+ * What the articulations of a note change in what it plays: the part of its duration that sounds and
+ * its velocity. The start of the note doesn't change, so neither do the timemap nor the score times.
+ * In MusicXML every note of a chord has its own; in MEI they can also be on the chord.
+ */
+void GetArticulationFactors(const Note *note, double &durationFactor, double &velocityFactor)
+{
+    durationFactor = 1.0;
+    velocityFactor = 1.0;
+
+    std::set<data_ARTICULATION> values;
+    auto collect = [&values](const Object *object) {
+        if (!object) return;
+        const ListOfConstObjects artics = object->FindAllDescendantsByType(ARTIC, false, 1);
+        for (const Object *child : artics) {
+            const Artic *artic = vrv_cast<const Artic *>(child);
+            for (const data_ARTICULATION value : artic->GetArtic()) values.insert(value);
+        }
+    };
+    collect(note);
+    collect(note->IsChordTone());
+    if (values.empty()) return;
+
+    auto has = [&values](data_ARTICULATION value) { return values.count(value) > 0; };
+
+    // The shortest of them, and the tenuto holds the note (with a staccato, it's the portato)
+    if (has(ARTICULATION_stacciss) || has(ARTICULATION_spicc)) durationFactor = 0.3;
+    else if (has(ARTICULATION_stacc)) durationFactor = has(ARTICULATION_ten) ? 0.75 : 0.5;
+    else if (has(ARTICULATION_marc)) durationFactor = 0.75;
+
+    // The strongest of them
+    if (has(ARTICULATION_marc)) velocityFactor = 1.25;
+    else if (has(ARTICULATION_acc)) velocityFactor = 1.15;
+    else if (has(ARTICULATION_acc_soft)) velocityFactor = 1.08;
+}
+
+/// The shortest a shortened note sounds, in seconds: shorter, it would be a click
+const double MIDI_ARTICULATION_MIN_SECONDS = 0.06;
+
+} // namespace
+
 FunctorCode GenerateMIDIFunctor::VisitNote(const Note *note)
 {
     this->HandleOctave(note);
@@ -831,8 +876,15 @@ FunctorCode GenerateMIDIFunctor::VisitNote(const Note *note)
         return FUNCTOR_SIBLINGS;
     }
 
-    const int velocity = (note->HasVel()) ? note->GetVel() : MIDI_VELOCITY;
+    int velocity = (note->HasVel()) ? note->GetVel() : MIDI_VELOCITY;
     if (!velocity) return FUNCTOR_SIBLINGS;
+
+    double durationFactor = 1.0;
+    double velocityFactor = 1.0;
+    GetArticulationFactors(note, durationFactor, velocityFactor);
+    if (velocityFactor != 1.0) {
+        velocity = std::clamp(static_cast<int>(std::lround(velocity * velocityFactor)), 1, 127);
+    }
 
     const int channel = m_midiChannel;
     const int tpq = m_midiFile->getTPQ();
@@ -896,8 +948,15 @@ FunctorCode GenerateMIDIFunctor::VisitNote(const Note *note)
             m_midiFile->addNoteOn(m_midiTrack, startTime * tpq, channel, pitch, velocity);
         }
         else {
-            const double stopTime
+            double stopTime
                 = m_totalTime + note->GetScoreTimeOffset().ToDouble() + note->GetScoreTimeTiedDuration().ToDouble();
+
+            // Shortened by its articulation, never below the shortest it can sound
+            if ((durationFactor < 1.0) && (stopTime > startTime)) {
+                const double minDuration = MIDI_ARTICULATION_MIN_SECONDS * m_currentTempo / 60.0;
+                const double duration = stopTime - startTime;
+                stopTime = startTime + std::min(duration, std::max(duration * durationFactor, minDuration));
+            }
 
             m_midiFile->addNoteOn(m_midiTrack, startTime * tpq, channel, pitch, velocity);
             m_midiFile->addNoteOff(m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, pitch);
