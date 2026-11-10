@@ -902,6 +902,10 @@ void GetArticulationFactors(const Note *note, double &durationFactor, double &ve
 /// The shortest a shortened note sounds, in seconds: shorter, it would be a click
 const double MIDI_ARTICULATION_MIN_SECONDS = 0.06;
 
+/// The release velocity of the note-off of a note shortened by its articulation. The other notes end
+/// with a note-on of velocity 0, as before
+const int MIDI_SHORTENED_RELEASE_VELOCITY = 127;
+
 /// Each note of a trill, in seconds (about 12 notes per second)
 const double MIDI_TRILL_NOTE_SECONDS = 0.08;
 
@@ -1022,14 +1026,24 @@ FunctorCode GenerateMIDIFunctor::VisitNote(const Note *note)
                 = m_totalTime + note->GetScoreTimeOffset().ToDouble() + note->GetScoreTimeTiedDuration().ToDouble();
 
             // Shortened by its articulation, never below the shortest it can sound
+            bool isShortened = false;
             if ((durationFactor < 1.0) && (stopTime > startTime)) {
                 const double minDuration = MIDI_ARTICULATION_MIN_SECONDS * m_currentTempo / 60.0;
                 const double duration = stopTime - startTime;
                 stopTime = startTime + std::min(duration, std::max(duration * durationFactor, minDuration));
+                isShortened = true;
             }
 
             m_midiFile->addNoteOn(m_midiTrack, startTime * tpq, channel, pitch, velocity);
-            m_midiFile->addNoteOff(m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, pitch);
+            if (isShortened) {
+                // Released fast: a note-off with the highest release velocity. A player can choose a
+                // short sound for it (the samples of a staccato)
+                m_midiFile->addNoteOff(
+                    m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, pitch, MIDI_SHORTENED_RELEASE_VELOCITY);
+            }
+            else {
+                m_midiFile->addNoteOff(m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, pitch);
+            }
         }
     }
 
