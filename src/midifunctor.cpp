@@ -818,8 +818,67 @@ FunctorCode GenerateMIDIFunctor::VisitFTrem(const FTrem *fTrem)
 {
     this->HandleOctave(fTrem);
 
+    // The two notes or chords that alternate
+    std::vector<const LayerElement *> elements;
+    for (const Object *child : fTrem->GetChildren()) {
+        if (child->Is(NOTE) || child->Is(CHORD)) elements.push_back(vrv_cast<const LayerElement *>(child));
+    }
+    if (elements.size() != 2) return FUNCTOR_CONTINUE;
+    auto notesOf = [](const LayerElement *element) -> std::vector<const Note *> {
+        std::vector<const Note *> notes;
+        if (element->Is(CHORD)) {
+            for (const Object *object : element->FindAllDescendantsByType(NOTE, false)) {
+                notes.push_back(vrv_cast<const Note *>(object));
+            }
+        }
+        else {
+            notes.push_back(vrv_cast<const Note *>(element));
+        }
+        return notes;
+    };
+    const std::vector<const Note *> first = notesOf(elements[0]);
+    const std::vector<const Note *> second = notesOf(elements[1]);
+    if (first.empty() || second.empty()) return FUNCTOR_CONTINUE;
+
+    // Each note of the tremolo: its unit, or one beam an eighth, two a sixteenth... whatever the notes are
+    data_DURATION unit = DURATION_NONE;
     if (fTrem->HasUnitdur()) {
-        LogWarning("FTrem produces incorrect MIDI output");
+        unit = fTrem->GetUnitdur();
+    }
+    else if (fTrem->GetBeams() > 0) {
+        unit = static_cast<data_DURATION>(std::min(DURATION_4 + fTrem->GetBeams(), int(DURATION_2048)));
+    }
+    if ((unit < DURATION_long) || (unit > DURATION_2048)) return FUNCTOR_CONTINUE;
+    const double unitInQuarters = pow(2.0, DURATION_4 - unit);
+
+    // The two share the time: the notes of both, one after the other
+    auto durationOf = [](const Note *note) {
+        return note->GetScoreTimeDuration().ToDouble() + note->GetScoreTimeTiedDuration().ToDouble();
+    };
+    if ((first.front()->GetScoreTimeTiedDuration() < 0) || (second.front()->GetScoreTimeTiedDuration() < 0)) {
+        return FUNCTOR_CONTINUE;
+    }
+    const double firstDuration = durationOf(first.front());
+    const double total = firstDuration + durationOf(second.front());
+    if ((firstDuration <= 0.0) || (total <= firstDuration)) return FUNCTOR_CONTINUE;
+    const int count = std::max(2, int(std::lround(total / unitInQuarters)));
+    const double noteDuration = total / count;
+
+    // The notes of the first one play the whole tremolo, with the note of the second one at the same
+    // place of the chord in between: the second one starts later. A second one with more notes plays
+    // the others from its start
+    for (size_t i = 0; i < std::max(first.size(), second.size()); ++i) {
+        const Note *host = (i < first.size()) ? first.at(i) : second.at(i);
+        const int firstPitch = (i < first.size()) ? this->GetMIDIPitch(first.at(i)) : -1;
+        const int secondPitch = (i < second.size()) ? this->GetMIDIPitch(second.at(i)) : -1;
+        const int from = (i < first.size()) ? 0 : int(std::lround(firstDuration / noteDuration));
+        MIDINoteSequence sequence;
+        for (int n = from; n < count; ++n) {
+            sequence.push_back({ (n % 2 == 0) ? firstPitch : secondPitch, noteDuration, true });
+        }
+        m_expandedNotes[host] = sequence;
+        // Played by the first one
+        if ((i < first.size()) && (i < second.size())) m_expandedNotes[second.at(i)] = MIDINoteSequence();
     }
 
     return FUNCTOR_CONTINUE;
@@ -1022,10 +1081,15 @@ FunctorCode GenerateMIDIFunctor::VisitNote(const Note *note)
         const MIDINoteSequence &sequence = ornamentNotes.empty() ? m_expandedNotes.at(note) : ornamentNotes;
         for (const auto &midiNote : sequence) {
             const double stopTime = startTime + midiNote.duration;
+            // A rest: the time of another note
+            if (midiNote.pitch < 0) {
+                startTime = stopTime;
+                continue;
+            }
 
             m_midiFile->addNoteOn(m_midiTrack, startTime * tpq, channel, midiNote.pitch, velocity);
-            // The notes of an ornament, one into the other
-            if (!ornamentNotes.empty()) {
+            // The notes of an ornament and of a fingered tremolo, one into the other
+            if (!ornamentNotes.empty() || midiNote.isLegato) {
                 m_midiFile->addNoteOff(m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, midiNote.pitch,
                     MIDI_SLURRED_RELEASE_VELOCITY);
             }

@@ -351,8 +351,11 @@ private:
  * Helper struct to store note sequences which replace notes in MIDI output due to expanded ornaments and tremolandi
  */
 struct MIDINote {
+    /// Negative: a rest, the time of another note
     int pitch;
     double duration;
+    /// Played into the next one, as under a slur (the notes of a fingered tremolo)
+    bool isLegato = false;
 };
 
 using MIDINoteSequence = std::list<MIDINote>;
