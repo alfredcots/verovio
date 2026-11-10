@@ -18,12 +18,15 @@
 #include "artic.h"
 #include "beatrpt.h"
 #include "btrem.h"
+#include "chord.h"
 #include "doc.h"
 #include "featureextractor.h"
 #include "ftrem.h"
 #include "gracegrp.h"
 #include "instrdef.h"
+#include "keysig.h"
 #include "layer.h"
+#include "mordent.h"
 #include "mrest.h"
 #include "multirest.h"
 #include "octave.h"
@@ -31,11 +34,15 @@
 #include "refrain.h"
 #include "rest.h"
 #include "staff.h"
+#include "staffdef.h"
 #include "syl.h"
 #include "tabgrp.h"
 #include "tempo.h"
 #include "text.h"
 #include "tie.h"
+#include "transposition.h"
+#include "trill.h"
+#include "turn.h"
 #include "timemap.h"
 #include "tuplet.h"
 #include "verse.h"
@@ -589,6 +596,46 @@ FunctorCode InitMIDIFunctor::VisitMeasure(const Measure *measure)
     return FUNCTOR_CONTINUE;
 }
 
+FunctorCode InitMIDIFunctor::VisitMordent(const Mordent *mordent)
+{
+    this->AddOrnament(mordent, mordent->GetStart());
+
+    return FUNCTOR_CONTINUE;
+}
+
+FunctorCode InitMIDIFunctor::VisitTrill(const Trill *trill)
+{
+    this->AddOrnament(trill, trill->GetStart());
+
+    return FUNCTOR_CONTINUE;
+}
+
+FunctorCode InitMIDIFunctor::VisitTurn(const Turn *turn)
+{
+    this->AddOrnament(turn, turn->GetStart());
+
+    return FUNCTOR_CONTINUE;
+}
+
+void InitMIDIFunctor::AddOrnament(const Object *ornament, const LayerElement *start)
+{
+    // An ornament without a start (e.g., an unresolved @startid or only a @tstamp) is not played
+    if (!start) return;
+
+    const Note *note = NULL;
+    if (start->Is(NOTE)) {
+        note = vrv_cast<const Note *>(start);
+    }
+    else if (start->Is(CHORD)) {
+        // In a chord, only the top note plays it
+        note = vrv_cast<const Chord *>(start)->GetTopNote();
+    }
+    if (!note) return;
+
+    // With more than one, the first one is played
+    m_ornaments.emplace(note, OrnamentInfo{ ornament->GetClassId(), ornament });
+}
+
 FunctorCode InitMIDIFunctor::VisitOctave(const Octave *octave)
 {
     // An octave without start or end (e.g., an unresolved @endid) is not rendered and is ignored
@@ -855,6 +902,15 @@ void GetArticulationFactors(const Note *note, double &durationFactor, double &ve
 /// The shortest a shortened note sounds, in seconds: shorter, it would be a click
 const double MIDI_ARTICULATION_MIN_SECONDS = 0.06;
 
+/// Each note of a trill, in seconds (about 12 notes per second)
+const double MIDI_TRILL_NOTE_SECONDS = 0.08;
+
+/// Each short note of a mordent or a turn, in seconds
+const double MIDI_ORNAMENT_NOTE_SECONDS = 0.065;
+
+/// The shortest a note of an ornament can be, in seconds: with a shorter note, the ornament isn't played
+const double MIDI_ORNAMENT_MIN_SECONDS = 0.03;
+
 } // namespace
 
 FunctorCode GenerateMIDIFunctor::VisitNote(const Note *note)
@@ -896,10 +952,24 @@ FunctorCode GenerateMIDIFunctor::VisitNote(const Note *note)
         m_deferredNotes.erase(note);
     }
 
+    // The ornament of the note (a tremolo is played instead)
+    MIDINoteSequence ornamentNotes;
+    const bool hasTabCourse = note->HasTabCourse() && (note->GetTabCourse() >= 1);
+    if ((m_expandedNotes.find(note) == m_expandedNotes.end()) && !hasTabCourse) {
+        const auto ornamentIter = m_ornaments.find(note);
+        if (ornamentIter != m_ornaments.end()) {
+            const double stopTime
+                = m_totalTime + note->GetScoreTimeOffset().ToDouble() + note->GetScoreTimeTiedDuration().ToDouble();
+            ornamentNotes
+                = this->ExpandOrnament(note, ornamentIter->second, this->GetMIDIPitch(note), stopTime - startTime);
+        }
+    }
+
     // Check if note was expanded into sequence of short notes due to trills/tremolandi
     // Play either the expanded note sequence or a single note
-    if (m_expandedNotes.find(note) != m_expandedNotes.end()) {
-        for (const auto &midiNote : m_expandedNotes.at(note)) {
+    if (!ornamentNotes.empty() || (m_expandedNotes.find(note) != m_expandedNotes.end())) {
+        const MIDINoteSequence &sequence = ornamentNotes.empty() ? m_expandedNotes.at(note) : ornamentNotes;
+        for (const auto &midiNote : sequence) {
             const double stopTime = startTime + midiNote.duration;
 
             m_midiFile->addNoteOn(m_midiTrack, startTime * tpq, channel, midiNote.pitch, velocity);
@@ -1212,6 +1282,129 @@ void GenerateMIDIFunctor::HandleOctave(const LayerElement *layerElement)
         m_octaveShift += octaveIter->octaveShift;
         octaveIter->isActive = true;
     }
+}
+
+MIDINoteSequence GenerateMIDIFunctor::ExpandOrnament(
+    const Note *note, const OrnamentInfo &info, int pitch, double duration)
+{
+    MIDINoteSequence sequence;
+    if (duration <= 0.0) return sequence;
+
+    // From seconds to quarter notes at the tempo of the measure
+    const double quarterNotesPerSecond = m_currentTempo / 60.0;
+    const double minNote = MIDI_ORNAMENT_MIN_SECONDS * quarterNotesPerSecond;
+
+    // The short notes first, then the main note for the rest of the duration
+    auto shortNotesThenMain = [&sequence, pitch, duration, minNote, quarterNotesPerSecond](
+                                  const std::vector<int> &shortPitches) {
+        const int count = static_cast<int>(shortPitches.size());
+        const double shortNote
+            = std::min(MIDI_ORNAMENT_NOTE_SECONDS * quarterNotesPerSecond, duration / (count + 1));
+        if (shortNote < minNote) return;
+        for (const int shortPitch : shortPitches) sequence.push_back({ shortPitch, shortNote });
+        sequence.push_back({ pitch, duration - count * shortNote });
+    };
+
+    if (info.type == TRILL) {
+        const Trill *trill = vrv_cast<const Trill *>(info.ornament);
+        const int upper = this->GetNeighborPitch(note, pitch, true, trill->GetAccidupper());
+        // Main, upper, main... with an odd number of notes, so that it ends on the main note
+        int count = static_cast<int>(duration / (MIDI_TRILL_NOTE_SECONDS * quarterNotesPerSecond));
+        if (count % 2 == 0) --count;
+        count = std::max(count, 3);
+        const double trillNote = duration / count;
+        if (trillNote < minNote) return sequence;
+        for (int i = 0; i < count; ++i) sequence.push_back({ (i % 2) ? upper : pitch, trillNote });
+    }
+    else if (info.type == MORDENT) {
+        const Mordent *mordent = vrv_cast<const Mordent *>(info.ornament);
+        // Without a form, the mordent is the lower one
+        const bool above = (mordent->GetForm() == mordentLog_FORM_upper);
+        const int neighbor = this->GetNeighborPitch(
+            note, pitch, above, above ? mordent->GetAccidupper() : mordent->GetAccidlower());
+        if (mordent->GetLong() == BOOLEAN_true) {
+            shortNotesThenMain({ pitch, neighbor, pitch, neighbor });
+        }
+        else {
+            shortNotesThenMain({ pitch, neighbor });
+        }
+    }
+    else if (info.type == TURN) {
+        const Turn *turn = vrv_cast<const Turn *>(info.ornament);
+        const int upper = this->GetNeighborPitch(note, pitch, true, turn->GetAccidupper());
+        const int lower = this->GetNeighborPitch(note, pitch, false, turn->GetAccidlower());
+        // Without a form, the turn starts above
+        const bool inverted = (turn->GetForm() == turnLog_FORM_lower);
+        const int first = inverted ? lower : upper;
+        const int third = inverted ? upper : lower;
+        if (turn->GetDelayed() == BOOLEAN_true) {
+            // The main note, and the turn at its end, leading to the next note
+            const double shortNote = std::min(MIDI_ORNAMENT_NOTE_SECONDS * quarterNotesPerSecond, duration / 4);
+            if (shortNote < minNote) return sequence;
+            sequence.push_back({ pitch, duration - 3 * shortNote });
+            sequence.push_back({ first, shortNote });
+            sequence.push_back({ pitch, shortNote });
+            sequence.push_back({ third, shortNote });
+        }
+        else {
+            shortNotesThenMain({ first, pitch, third });
+        }
+    }
+
+    return sequence;
+}
+
+int GenerateMIDIFunctor::GetNeighborPitch(
+    const Note *note, int pitch, bool above, data_ACCIDENTAL_WRITTEN accid) const
+{
+    // Without a written pitch, a whole tone
+    if (!note->HasPname() || !note->HasOct()) return pitch + (above ? 2 : -2);
+
+    const int step = note->GetDiatonicPitch() + (above ? 1 : -1);
+    const int oct = (step >= 0) ? (step / 7) : ((step - 6) / 7);
+    const data_PITCHNAME pname = static_cast<data_PITCHNAME>(step - oct * 7 + PITCHNAME_c);
+
+    int alteration = 0;
+    if (accid != ACCIDENTAL_WRITTEN_NONE) {
+        alteration = TransPitch::GetChromaticAlteration(ACCIDENTAL_GESTURAL_NONE, accid);
+    }
+    else {
+        bool found = false;
+        // The last note of that pitch earlier in the measure, on any layer of the staff
+        const Staff *staff = note->GetAncestorStaff(ANCESTOR_ONLY, false);
+        if (staff) {
+            const double onset = note->GetScoreTimeOnset().ToDouble();
+            double lastOnset = -1.0;
+            const ListOfConstObjects notes = staff->FindAllDescendantsByType(NOTE);
+            for (const Object *object : notes) {
+                const Note *previous = vrv_cast<const Note *>(object);
+                if ((previous->GetPname() != pname) || (previous->GetOct() != oct)) continue;
+                const double previousOnset = previous->GetScoreTimeOnset().ToDouble();
+                if ((previousOnset >= onset) || (previousOnset < lastOnset)) continue;
+                lastOnset = previousOnset;
+                alteration = previous->GetTransPitch().m_accid;
+                found = true;
+            }
+        }
+        // Otherwise, the key signature
+        if (!found && staff && staff->m_drawingStaffDef) {
+            const KeySig *keySig = staff->m_drawingStaffDef->GetCurrentKeySig();
+            if (keySig) {
+                MapOfOctavedPitchAccid keyAccids;
+                keySig->FillMap(keyAccids);
+                const auto keyIter = keyAccids.find(pname + oct * 7);
+                if (keyIter != keyAccids.end()) {
+                    alteration = TransPitch::GetChromaticAlteration(ACCIDENTAL_GESTURAL_NONE, keyIter->second);
+                }
+            }
+        }
+    }
+
+    // The interval from the written note to its neighbor, added to the sounding pitch
+    const int mainWritten
+        = Note::PnameToPclass(note->GetPname()) + note->GetTransPitch().m_accid + (note->GetOct() + 1) * 12;
+    const int neighborWritten = Note::PnameToPclass(pname) + alteration + (oct + 1) * 12;
+    return pitch + (neighborWritten - mainWritten);
 }
 
 int GenerateMIDIFunctor::GetMIDIPitch(const Note *note)

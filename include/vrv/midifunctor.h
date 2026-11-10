@@ -273,6 +273,14 @@ struct OctaveInfo {
 };
 
 /**
+ * Helper struct to store the ornament (trill, mordent or turn) of a note
+ */
+struct OrnamentInfo {
+    ClassId type;
+    const Object *ornament;
+};
+
+/**
  * This class initializes the MIDI export.
  * Captures information (i.e. from control elements) for MIDI interpretation
  * which is required beforehand in GenerateMIDI.
@@ -298,6 +306,7 @@ public:
     ///@{
     void SetCurrentTempo(double tempo) { m_currentTempo = tempo; }
     const std::list<OctaveInfo> &GetOctaves() const { return m_octaves; }
+    const std::map<const Note *, OrnamentInfo> &GetOrnaments() const { return m_ornaments; }
     ///@}
 
     /*
@@ -305,13 +314,20 @@ public:
      */
     ///@{
     FunctorCode VisitMeasure(const Measure *measure) override;
+    FunctorCode VisitMordent(const Mordent *mordent) override;
     FunctorCode VisitOctave(const Octave *octave) override;
+    FunctorCode VisitTrill(const Trill *trill) override;
+    FunctorCode VisitTurn(const Turn *turn) override;
     ///@}
 
 protected:
     //
 private:
-    //
+    /**
+     * Register the ornament of the note it starts on (the top note of a chord)
+     */
+    void AddOrnament(const Object *ornament, const LayerElement *start);
+
 public:
     //
 private:
@@ -319,6 +335,8 @@ private:
     double m_currentTempo;
     // Octave info which is collected
     std::list<OctaveInfo> m_octaves;
+    // Ornaments (trills, mordents, turns) by the note they are on
+    std::map<const Note *, OrnamentInfo> m_ornaments;
 };
 
 //----------------------------------------------------------------------------
@@ -379,6 +397,7 @@ public:
     void SetDeferredNotes(const std::map<const Note *, double> &deferredNotes) { m_deferredNotes = deferredNotes; }
     void SetLayerN(int layerN) { m_layerN = layerN; }
     void SetOctaves(const std::list<OctaveInfo> &octaves) { m_octaves = octaves; }
+    void SetOrnaments(const std::map<const Note *, OrnamentInfo> &ornaments) { m_ornaments = ornaments; }
     void SetStaffN(int staffN) { m_staffN = staffN; }
     void SetTempoEventTicks(const std::set<int> &ticks) { m_tempoEventTicks = ticks; }
     void SetTrack(int track) { m_midiTrack = track; }
@@ -430,6 +449,18 @@ private:
      */
     int GetMIDIPitch(const Note *note);
 
+    /**
+     * The notes an ornament plays instead of its note, filling the given duration (in quarter notes).
+     * Empty when the note is too short for it.
+     */
+    MIDINoteSequence ExpandOrnament(const Note *note, const OrnamentInfo &info, int pitch, double duration);
+
+    /**
+     * The MIDI pitch of the step above or below a note: with the accidental of the ornament if it has one,
+     * otherwise with the one of the last note of that pitch earlier in the measure, or of the key signature.
+     */
+    int GetNeighborPitch(const Note *note, int pitch, bool above, data_ACCIDENTAL_WRITTEN accid) const;
+
 public:
     //
 private:
@@ -462,6 +493,8 @@ private:
     std::map<const Note *, double> m_deferredNotes;
     // Octave info which is used to determine the octave shift
     std::list<OctaveInfo> m_octaves;
+    // Ornaments (trills, mordents, turns) by the note they are on
+    std::map<const Note *, OrnamentInfo> m_ornaments;
     // Indicates whether cue notes should be included
     bool m_noCue;
     // Tablature held notes indexed by (course - 1)
