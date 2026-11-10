@@ -33,6 +33,7 @@
 #include "pedal.h"
 #include "refrain.h"
 #include "rest.h"
+#include "slur.h"
 #include "staff.h"
 #include "staffdef.h"
 #include "syl.h"
@@ -603,6 +604,37 @@ FunctorCode InitMIDIFunctor::VisitMordent(const Mordent *mordent)
     return FUNCTOR_CONTINUE;
 }
 
+FunctorCode InitMIDIFunctor::VisitSlur(const Slur *slur)
+{
+    const LayerElement *start = slur->GetStart();
+    const LayerElement *end = slur->GetEnd();
+    if (!start || !end) return FUNCTOR_CONTINUE;
+    // A note of a chord: the chord, as GenerateMIDIFunctor::VisitNote sees it
+    auto element = [](const LayerElement *element) -> const LayerElement * {
+        if (element->Is(NOTE)) {
+            const Chord *chord = vrv_cast<const Note *>(element)->IsChordTone();
+            if (chord) return chord;
+        }
+        return element;
+    };
+    start = element(start);
+    end = element(end);
+    if (start == end) return FUNCTOR_CONTINUE;
+    if (!(start->Is(NOTE) || start->Is(CHORD)) || !(end->Is(NOTE) || end->Is(CHORD))) return FUNCTOR_CONTINUE;
+
+    // Only the slurs within a layer: the MIDI is generated layer by layer
+    const Layer *startLayer = vrv_cast<const Layer *>(start->GetFirstAncestor(LAYER));
+    const Layer *endLayer = vrv_cast<const Layer *>(end->GetFirstAncestor(LAYER));
+    const Staff *startStaff = start->GetAncestorStaff(ANCESTOR_ONLY, false);
+    const Staff *endStaff = end->GetAncestorStaff(ANCESTOR_ONLY, false);
+    if (!startLayer || !endLayer || !startStaff || !endStaff) return FUNCTOR_CONTINUE;
+    if ((startLayer->GetN() != endLayer->GetN()) || (startStaff->GetN() != endStaff->GetN())) return FUNCTOR_CONTINUE;
+
+    m_slurs.emplace(start, end);
+
+    return FUNCTOR_CONTINUE;
+}
+
 FunctorCode InitMIDIFunctor::VisitTrill(const Trill *trill)
 {
     this->AddOrnament(trill, trill->GetStart());
@@ -906,6 +938,10 @@ const double MIDI_ARTICULATION_MIN_SECONDS = 0.06;
 /// with a note-on of velocity 0, as before
 const int MIDI_SHORTENED_RELEASE_VELOCITY = 127;
 
+/// The release velocity of the note-off of a note under a slur (after its first note) or of a note of
+/// an ornament: released slowly, into the next one
+const int MIDI_SLURRED_RELEASE_VELOCITY = 1;
+
 /// Each note of a trill, in seconds (about 12 notes per second)
 const double MIDI_TRILL_NOTE_SECONDS = 0.08;
 
@@ -920,6 +956,17 @@ const double MIDI_ORNAMENT_MIN_SECONDS = 0.03;
 FunctorCode GenerateMIDIFunctor::VisitNote(const Note *note)
 {
     this->HandleOctave(note);
+
+    // Under a slur: the notes after the first one of the slur, until its last one. A chord is one
+    // element: its notes are visited one after the other
+    const LayerElement *slurElement = note->IsChordTone() ? (const LayerElement *)note->IsChordTone() : note;
+    if (slurElement != m_slurElement) {
+        if (m_slurElement) m_openSlurEnds.remove(m_slurElement);
+        m_slurElement = slurElement;
+        m_isSlurred = !m_openSlurEnds.empty();
+        const auto starting = m_slurs.equal_range(slurElement);
+        for (auto iter = starting.first; iter != starting.second; ++iter) m_openSlurEnds.push_back(iter->second);
+    }
 
     // Skip linked notes
     if (note->HasSameasLink()) {
@@ -977,7 +1024,14 @@ FunctorCode GenerateMIDIFunctor::VisitNote(const Note *note)
             const double stopTime = startTime + midiNote.duration;
 
             m_midiFile->addNoteOn(m_midiTrack, startTime * tpq, channel, midiNote.pitch, velocity);
-            m_midiFile->addNoteOff(m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, midiNote.pitch);
+            // The notes of an ornament, one into the other
+            if (!ornamentNotes.empty()) {
+                m_midiFile->addNoteOff(m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, midiNote.pitch,
+                    MIDI_SLURRED_RELEASE_VELOCITY);
+            }
+            else {
+                m_midiFile->addNoteOff(m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, midiNote.pitch);
+            }
 
             startTime = stopTime;
         }
@@ -1040,6 +1094,10 @@ FunctorCode GenerateMIDIFunctor::VisitNote(const Note *note)
                 // short sound for it (the samples of a staccato)
                 m_midiFile->addNoteOff(
                     m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, pitch, MIDI_SHORTENED_RELEASE_VELOCITY);
+            }
+            else if (m_isSlurred) {
+                m_midiFile->addNoteOff(
+                    m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, pitch, MIDI_SLURRED_RELEASE_VELOCITY);
             }
             else {
                 m_midiFile->addNoteOff(m_midiTrack, std::max(0.0, stopTime * tpq - 1), channel, pitch);

@@ -619,6 +619,7 @@ void Doc::ExportMIDI(smf::MidiFile *midiFile)
             generateMIDI.SetCurrentTempo(tempo);
             generateMIDI.SetOctaves(initMIDI.GetOctaves());
             generateMIDI.SetOrnaments(initMIDI.GetOrnaments());
+            generateMIDI.SetSlurs(initMIDI.GetSlurs());
             generateMIDI.SetNoCue(this->GetOptions()->m_midiNoCue.GetValue());
             generateMIDI.SetControlEvents(controlEvents);
             generateMIDI.SetInstrDef(instrDef);

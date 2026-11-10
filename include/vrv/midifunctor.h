@@ -307,6 +307,7 @@ public:
     void SetCurrentTempo(double tempo) { m_currentTempo = tempo; }
     const std::list<OctaveInfo> &GetOctaves() const { return m_octaves; }
     const std::map<const Note *, OrnamentInfo> &GetOrnaments() const { return m_ornaments; }
+    const std::multimap<const LayerElement *, const LayerElement *> &GetSlurs() const { return m_slurs; }
     ///@}
 
     /*
@@ -316,6 +317,7 @@ public:
     FunctorCode VisitMeasure(const Measure *measure) override;
     FunctorCode VisitMordent(const Mordent *mordent) override;
     FunctorCode VisitOctave(const Octave *octave) override;
+    FunctorCode VisitSlur(const Slur *slur) override;
     FunctorCode VisitTrill(const Trill *trill) override;
     FunctorCode VisitTurn(const Turn *turn) override;
     ///@}
@@ -337,6 +339,8 @@ private:
     std::list<OctaveInfo> m_octaves;
     // Ornaments (trills, mordents, turns) by the note they are on
     std::map<const Note *, OrnamentInfo> m_ornaments;
+    // Slurs: the element (note or chord) they end on, by the one they start on. Only within a layer
+    std::multimap<const LayerElement *, const LayerElement *> m_slurs;
 };
 
 //----------------------------------------------------------------------------
@@ -398,6 +402,7 @@ public:
     void SetLayerN(int layerN) { m_layerN = layerN; }
     void SetOctaves(const std::list<OctaveInfo> &octaves) { m_octaves = octaves; }
     void SetOrnaments(const std::map<const Note *, OrnamentInfo> &ornaments) { m_ornaments = ornaments; }
+    void SetSlurs(const std::multimap<const LayerElement *, const LayerElement *> &slurs) { m_slurs = slurs; }
     void SetStaffN(int staffN) { m_staffN = staffN; }
     void SetTempoEventTicks(const std::set<int> &ticks) { m_tempoEventTicks = ticks; }
     void SetTrack(int track) { m_midiTrack = track; }
@@ -495,6 +500,12 @@ private:
     std::list<OctaveInfo> m_octaves;
     // Ornaments (trills, mordents, turns) by the note they are on
     std::map<const Note *, OrnamentInfo> m_ornaments;
+    // Slurs by the element they start on, the ends of the slurs open now, the element (note or chord)
+    // they were last updated on, and if it is under a slur (after its first element)
+    std::multimap<const LayerElement *, const LayerElement *> m_slurs;
+    std::list<const LayerElement *> m_openSlurEnds;
+    const LayerElement *m_slurElement = NULL;
+    bool m_isSlurred = false;
     // Indicates whether cue notes should be included
     bool m_noCue;
     // Tablature held notes indexed by (course - 1)
